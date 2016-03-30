@@ -17,10 +17,10 @@ subject to this statement and the copyright notice above being included.
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
 IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM.
 """
-import subprocess, re, os, sys, signal
+import subprocess, re, os, sys, signal, io
 from binascii import hexlify
 
-VERSION = 'v1.0.0'
+VERSION = 'v1.1.0'
 
 filesystems = [
     ('vfat', 'fat32', ''),
@@ -102,47 +102,71 @@ def parse_filefrag(path):
         mergetotal += prev_size
         print('Merged extents: before={}:{}, after={}:{}, list={}'
                 .format(len(extent_list), total, len(merged), mergetotal, merged))
+        if total != mergetotal:
+            print('RESULT WARNING: Extent overlaps giving incorrect size!')
         extent_list = merged
         total = mergetotal
     return total, extent_list
 
-def test_filefrag(path, fstype, loop, elist):
-    "Validates the output of filefrag."
-    result = None
-    cmpsize = 256
-    if os.path.isfile(path) and os.stat(path).st_size > cmpsize:
-        with open(path, 'rb') as fdesc:
-            file1kA = fdesc.read(cmpsize)
-        readin = 0
+def dataread(loop, elist, size, start=True):
+    "Returns size data from the start or end according to the extent list."
+    readin = 0
+    data = b''
+    if start:
         i = 0
-        file1kB = b''
-        with open(loop, 'rb') as fdesc:
-            while readin < cmpsize:
-                estart, esize = elist[i]
-                esizeB = esize * 512
+        inc = 1
+    else:
+        i = len(elist) - 1
+        inc = -1
+
+    with open(loop, 'rb') as fdesc:
+        while readin < size:
+            estart, esize = elist[i]
+            estartB, esizeB = estart * 512, esize * 512
+            remaining = size - readin
+            if esizeB > remaining:
                 # Default seek whence is SEEK_SET, i.e. from start or 0
-                fdesc.seek(estart * 512)
-                remaining = cmpsize - readin
-                if esizeB >= (remaining):
-                    file1kB += fdesc.read(remaining)
-                    readin += remaining
+                if start:
+                    fdesc.seek(estartB)
+                    data += fdesc.read(remaining)
                 else:
-                    file1kB += fdesc.read(esizeB)
-                    readin += esizeB
-                i += 1
-        if file1kA == file1kB:
-            print('RESULT: filefrag validation PASSED for {}.'
+                    fdesc.seek(estartB + esizeB - remaining)
+                    data = fdesc.read(remaining) + data
+                readin += remaining
+            else:
+                fdesc.seek(estartB)
+                if start:
+                    data += fdesc.read(esizeB)
+                else:
+                    data = fdesc.read(esizeB) + data
+                readin += esizeB
+            i += inc
+    return data
+
+CMPSIZE = 256
+def test_filefrag(dataA, fstype, loop, elist, psize):
+    "Validates the output of filefrag. Loop must be unmounted."
+    dataB = dataread(loop, elist, CMPSIZE, True) + dataread(loop, elist, CMPSIZE, False)
+
+    maxend = 0
+    for estart, esize in elist:
+        maxend = max(maxend, estart + esize)
+    compare = (dataA == dataB)
+    inside = (maxend <= psize)
+    if compare and inside:
+        print('RESULT: filefrag validation PASSED for {}.'
+                        .format(fstype))
+        return True
+    else:
+        if not compare:
+            print('RESULT: filefrag data comparison FAILED for {}.'
                             .format(fstype))
-            result = True
-        else:
-            print('RESULT: filefrag validation FAILED for {}.'
-                            .format(fstype))
-            print('A: {}'.format(hexlify(file1kA)))
-            print('B: {}'.format(hexlify(file1kB)))
-            result = False
-    if result is None:
-        print('RESULT: File not suitable.')
-    return result
+            print('A: {}'.format(hexlify(dataA)))
+            print('B: {}'.format(hexlify(dataB)))
+        if not inside:
+            print('RESULT: filefrag extent inside check FAILED for {}: {} > {}.'
+                            .format(fstype, maxend, psize))
+        return False
 
 MOUNTED = False
 def cleanup():
@@ -165,7 +189,8 @@ def globalexceptions(typ, value, traceback):
 sys.excepthook = globalexceptions
 
 # CTRL+C HANDLER
-def signal_handler(signal, frame):
+def signal_handler(sig, frame):
+    "Add SIGINT handler for CTRL+C."
     print('Caught SIGINT!')
     cleanup()
     sys.exit(0)
@@ -188,21 +213,30 @@ for fstype, pttype, force in filesystems:
     exe('mount /dev/loop3p1 ./mnt')
     MOUNTED = True
     exe('cp ./random ./mnt/')
-    nsectors, elist = parse_filefrag('./mnt/random')
-    test_filefrag('./mnt/random', fstype, '/dev/loop3p1', elist)
     exe('df -B 512 ./mnt')
     stat = os.statvfs('./mnt')
     blksects = stat.f_frsize // 512
-    # Seems xfs can't completely fill available space
-    free = stat.f_bavail * blksects - 100
+    # Seems xfs/hfs can't completely fill available space sometimes
+    free = stat.f_bavail * blksects - 64
     exe('dd if=/dev/zero of=./mnt/empty bs=512 count=' + str(free))
     exe('df -B 512 ./mnt')
-    nsectors, elist = parse_filefrag('./mnt/empty')
+    nsectors, randextents = parse_filefrag('./mnt/random')
+    with open('./mnt/random', 'rb') as fdesc:
+        rand = fdesc.read(CMPSIZE)
+        fdesc.seek(-1 * CMPSIZE, io.SEEK_END)
+        rand += fdesc.read()
+    nsectors, emptyextents = parse_filefrag('./mnt/empty')
+    with open('./mnt/empty', 'rb') as fdesc:
+        empty = fdesc.read(CMPSIZE)
+        fdesc.seek(-1 * CMPSIZE, io.SEEK_END)
+        empty += fdesc.read()
     exe('umount /dev/loop3p1')
     MOUNTED = False
     if fstype not in ('ntfs', 'btrfs', 'xfs'):
         exe('fsck /dev/loop3p1 -- -n')
-    exe('cat /sys/class/block/loop3p1/size')
+    psize = int(exe('cat /sys/class/block/loop3p1/size'))
+    test_filefrag(rand,  fstype, '/dev/loop3p1', randextents,  psize)
+    test_filefrag(empty, fstype, '/dev/loop3p1', emptyextents, psize)
     print('### FINISH {} ###'.format(fstype))
 
 cleanup()
