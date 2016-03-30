@@ -21,7 +21,7 @@ A python script that validates the output of filefrag -e for various filesystems
 * hfsprogs
 
 ##Results:
-Tested on Ubuntu 14.04 with e2fsprogs v1.42.12: vfat FAILED, btrfs ERROR, others: PASSED
+See the [wiki](https://github.com/racitup/testfilefrag/wiki)
 
 ##Known issues:
  btrfs mkfs causes exception with:
