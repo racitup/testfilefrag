@@ -20,6 +20,8 @@ IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM.
 import subprocess, re, os, sys, signal
 from binascii import hexlify
 
+VERSION = 'v1.0.0'
+
 filesystems = [
     ('vfat', 'fat32', ''),
     ('ext4', 'ext4', ''),
